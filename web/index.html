@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 BLE Controller</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; margin-top: 50px; background: #f4f4f4; }
+        button { padding: 15px 25px; font-size: 18px; margin: 10px; cursor: pointer; border-radius: 8px; border: none; }
+        #connectBtn { background-color: #007bff; color: white; }
+        #onBtn { background-color: #28a745; color: white; }
+        #offBtn { background-color: #dc3545; color: white; }
+        button:disabled { background-color: #cccccc; cursor: not-allowed; }
+        #status { margin-top: 20px; font-weight: bold; color: #333; }
+    </style>
+</head>
+<body>
+
+    <h1>ESP32 BLE LED Control</h1>
+    
+    <button id="connectBtn" onclick="connectToDevice()">Connect to ESP32</button>
+    <br><br>
+    <button id="onBtn" onclick="toggleLed(1)" disabled>Turn ON</button>
+    <button id="offBtn" onclick="toggleLed(0)" disabled>Turn OFF</button>
+
+    <p id="status">Status: Disconnected</p>
+
+    <script>
+        // Must match the ESP32 code
+        const serviceUUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+        const charUUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+
+        let device;
+        let characteristic;
+
+        async function connectToDevice() {
+            try {
+                document.getElementById('status').innerText = "Status: Scanning...";
+                
+                device = await navigator.bluetooth.requestDevice({
+                    filters: [{ name: 'ESP32_LED_CONTROL' }],
+                    optionalServices: [serviceUUID]
+                });
+
+                document.getElementById('status').innerText = "Status: Connecting...";
+                
+                const server = await device.gatt.connect();
+                const service = await server.getPrimaryService(serviceUUID);
+                characteristic = await service.getCharacteristic(charUUID);
+
+                // Enable buttons
+                document.getElementById('connectBtn').disabled = true;
+                document.getElementById('onBtn').disabled = false;
+                document.getElementById('offBtn').disabled = false;
+                document.getElementById('status').innerText = "Status: Connected!";
+
+                // Listen for disconnection
+                device.addEventListener('gattserverdisconnected', onDisconnected);
+
+            } catch (error) {
+                console.error(error);
+                document.getElementById('status').innerText = "Status: Error - " + error;
+            }
+        }
+
+        async function toggleLed(state) {
+            if (!characteristic) return;
+
+            // Create a Uint8Array (byte) to send
+            // 1 for ON, 0 for OFF
+            const data = new Uint8Array([state]);
+
+            try {
+                await characteristic.writeValue(data);
+                console.log("Sent: " + state);
+            } catch (error) {
+                console.error("Write failed", error);
+                document.getElementById('status').innerText = "Status: Write Failed";
+            }
+        }
+
+        function onDisconnected(event) {
+            document.getElementById('status').innerText = "Status: Disconnected";
+            document.getElementById('connectBtn').disabled = false;
+            document.getElementById('onBtn').disabled = true;
+            document.getElementById('offBtn').disabled = true;
+        }
+    </script>
+</body>
+</html>
