@@ -30,6 +30,7 @@
 
     <div id="controls">
         <button id="decBtn" class="small-btn" onclick="sendPower(Math.max(0, currentPower-5))" disabled>-5%</button>
+        <button id="fullBtn" class="small-btn" onclick="sendPower(100)" disabled>100%</button>
         <button id="incBtn" class="small-btn" onclick="sendPower(Math.min(100, currentPower+5))" disabled>+5%</button>
     </div>
 
@@ -50,11 +51,14 @@
         const knob = document.getElementById('knob');
         const label = document.getElementById('powerLabel');
         const centerToggle = document.getElementById('centerToggle');
+        const container = document.getElementById('sliderWrap');
 
         const R = 72; // radius in svg coords
         const C = 100; // center
         const CIRC = 2 * Math.PI * R; // circumference
         progress.style.strokeDasharray = `${CIRC}`;
+        // smooth transition like slider.html
+        progress.style.transition = 'stroke-dashoffset 0.08s linear';
 
         function pctToOffset(p) {
             return CIRC * (1 - p / 100);
@@ -84,41 +88,66 @@
             return p;
         }
 
-        // Drag handling
-        let dragging = false;
-        function startDrag(evt) {
-            dragging = true;
-            const pt = getPoint(evt);
-            const p = pointToPercent(pt.x, pt.y);
-            setUI(p);
+        // Drag handling (mouse + touch) modeled after slider.html for smooth experience
+        let isDragging = false;
+        let lastSendTime = 0;
+        const SEND_THROTTLE_MS = 80; // send at most every 80ms while dragging
+
+        function getAngle(event) {
+            const rect = container.getBoundingClientRect();
+            const clientX = event.clientX || (event.touches && event.touches[0].clientX);
+            const clientY = event.clientY || (event.touches && event.touches[0].clientY);
+            const x = clientX - rect.left - rect.width / 2;
+            const y = clientY - rect.top - rect.height / 2;
+            let angle = Math.atan2(y, x) * (180 / Math.PI) + 90;
+            if (angle < 0) angle += 360;
+            return angle;
         }
-        function moveDrag(evt) {
-            if (!dragging) return;
-            const pt = getPoint(evt);
-            const p = pointToPercent(pt.x, pt.y);
-            setUI(p);
+
+        function handleInteraction(event) {
+            event.preventDefault();
+            const angle = getAngle(event);
+            const value = (angle / 360) * 100;
+            setUI(value);
+
+            // Throttle BLE writes while dragging for real-time feel without flooding
+            if (characteristic) {
+                const now = Date.now();
+                if (now - lastSendTime >= SEND_THROTTLE_MS) {
+                    // fire-and-forget write
+                    characteristic.writeValue(new Uint8Array([currentPower])).catch((e) => {
+                        console.warn('Throttled write failed', e);
+                    });
+                    lastSendTime = now;
+                }
+            }
         }
-        function endDrag(evt) {
-            if (!dragging) return;
-            dragging = false;
+
+        // Prevent slider interaction when clicking the center button
+        centerToggle.addEventListener('mousedown', (e) => e.stopPropagation());
+        centerToggle.addEventListener('touchstart', (e) => e.stopPropagation());
+
+        container.addEventListener('mousedown', (e) => { isDragging = true; handleInteraction(e); });
+        container.addEventListener('touchstart', (e) => { isDragging = true; handleInteraction(e); });
+
+        document.addEventListener('mousemove', (e) => { if (isDragging) handleInteraction(e); });
+        document.addEventListener('touchmove', (e) => { if (isDragging) handleInteraction(e); });
+
+        function stopDragAndSend(e) {
+            if (!isDragging) return;
+            isDragging = false;
             sendPower(currentPower);
         }
 
-        function getPoint(evt) {
-            const rect = svg.getBoundingClientRect();
-            const clientX = evt.touches ? evt.touches[0].clientX : evt.clientX;
-            const clientY = evt.touches ? evt.touches[0].clientY : evt.clientY;
-            const x = (clientX - rect.left) * (200 / rect.width);
-            const y = (clientY - rect.top) * (200 / rect.height);
-            return { x, y };
-        }
-
-        svg.addEventListener('pointerdown', (e) => { svg.setPointerCapture(e.pointerId); startDrag(e); });
-        svg.addEventListener('pointermove', moveDrag);
-        svg.addEventListener('pointerup', endDrag);
-        svg.addEventListener('pointercancel', endDrag);
+        document.addEventListener('mouseup', stopDragAndSend);
+        document.addEventListener('touchend', stopDragAndSend);
 
         // Center toggle
+        // Prevent slider dragging when interacting with center button
+        centerToggle.addEventListener('pointerdown', (e) => e.stopPropagation());
+        centerToggle.addEventListener('mousedown', (e) => e.stopPropagation());
+        centerToggle.addEventListener('touchstart', (e) => e.stopPropagation());
+
         centerToggle.addEventListener('click', () => {
             if (currentPower === 0) {
                 // restore
@@ -145,8 +174,17 @@
                 document.getElementById('status').innerText = "Status: Connected!";
                 document.getElementById('incBtn').disabled = false;
                 document.getElementById('decBtn').disabled = false;
+                document.getElementById('fullBtn').disabled = false;
                 device.addEventListener('gattserverdisconnected', onDisconnected);
                 window.addEventListener('wheel', onWheel);
+
+                // Subscribe to notifications from the characteristic
+                try {
+                    await characteristic.startNotifications();
+                    characteristic.addEventListener('characteristicvaluechanged', onNotification);
+                } catch (err) {
+                    console.warn('Notifications not available', err);
+                }
             } catch (error) {
                 console.error(error);
                 document.getElementById('status').innerText = "Status: Error - " + error;
@@ -165,12 +203,30 @@
             }
         }
 
-        function onDisconnected(event) {
+        // Notification handler: update UI when device reports value
+        function onNotification(event) {
+            const data = event.target.value;
+            if (!data || data.byteLength < 1) return;
+            const v = data.getUint8(0);
+            setUI(v);
+        }
+
+        async function onDisconnected(event) {
             document.getElementById('status').innerText = "Status: Disconnected";
             document.getElementById('connectBtn').disabled = false;
             document.getElementById('incBtn').disabled = true;
             document.getElementById('decBtn').disabled = true;
+            document.getElementById('fullBtn').disabled = true;
             window.removeEventListener('wheel', onWheel);
+            // Unsubscribe notifications
+            try {
+                if (characteristic) {
+                    characteristic.removeEventListener('characteristicvaluechanged', onNotification);
+                    await characteristic.stopNotifications();
+                }
+            } catch (err) {
+                console.warn('Failed to stop notifications', err);
+            }
         }
 
         function onWheel(e) {

@@ -76,6 +76,10 @@ static esp_ble_adv_params_t adv_params = {
 
 static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
+static esp_gatt_if_t g_gatts_if = 0;
+static uint16_t g_conn_id = 0;
+static uint16_t g_char_handle = 0;
+static bool g_connected = false;
 
 // Timer Alarm ISR
 static bool IRAM_ATTR triac_timer_cb(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data)
@@ -258,10 +262,28 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
 
         esp_ble_gatts_add_char(param->create.service_handle, &char_uuid,
                                ESP_GATT_PERM_WRITE,
-                               ESP_GATT_CHAR_PROP_BIT_WRITE,
+                               ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_NOTIFY,
                                NULL, NULL);
 
         esp_ble_gatts_start_service(param->create.service_handle);
+        break;
+    }
+
+    case ESP_GATTS_ADD_CHAR_EVT: {
+        // Save the attribute handle for notifications
+        g_char_handle = param->add_char.attr_handle;
+
+        // Add Client Characteristic Configuration Descriptor (CCCD) so client can enable notifications
+        esp_bt_uuid_t descr_uuid;
+        descr_uuid.len = ESP_UUID_LEN_16;
+        descr_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
+        esp_ble_gatts_add_char_descr(param->add_char.service_handle, &descr_uuid,
+                                     ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, NULL, NULL);
+        break;
+    }
+
+    case ESP_GATTS_ADD_CHAR_DESCR_EVT: {
+        // descriptor added
         break;
     }
 
@@ -275,20 +297,31 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             d_state.power_percent = (float)val;
             ESP_LOGI(TAG, "BLE set power: %d%%", val);
         }
-
         if (param->write.need_rsp)
         {
             esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
+        }
+
+        // Notify connected client of the updated value (if any)
+        if (g_connected && g_char_handle != 0) {
+            uint8_t notify_val = (uint8_t)d_state.power_percent;
+            esp_ble_gatts_send_indicate(g_gatts_if, g_conn_id, g_char_handle, 1, &notify_val, false);
         }
         break;
     }
 
     case ESP_GATTS_CONNECT_EVT:
         ESP_LOGI(TAG, "BLE connected");
+        g_connected = true;
+        g_gatts_if = gatts_if;
+        g_conn_id = param->connect.conn_id;
         break;
 
     case ESP_GATTS_DISCONNECT_EVT:
         ESP_LOGI(TAG, "BLE disconnected, restarting advertising");
+        g_connected = false;
+        g_conn_id = 0;
+        g_gatts_if = 0;
         esp_ble_gap_start_advertising(&adv_params);
         break;
 
