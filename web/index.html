@@ -3,88 +3,184 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ESP32 BLE Controller</title>
-    <style>
-        body { font-family: sans-serif; text-align: center; margin-top: 50px; background: #f4f4f4; }
-        button { padding: 15px 25px; font-size: 18px; margin: 10px; cursor: pointer; border-radius: 8px; border: none; }
-        #connectBtn { background-color: #007bff; color: white; }
-        #onBtn { background-color: #28a745; color: white; }
-        #offBtn { background-color: #dc3545; color: white; }
-        button:disabled { background-color: #cccccc; cursor: not-allowed; }
-        #status { margin-top: 20px; font-weight: bold; color: #333; }
-    </style>
+    <title>ESP32 Dimmer Controller</title>
+    <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
-    <h1>ESP32 BLE LED Control</h1>
-    
+    <h1>ESP32 Dimmer</h1>
     <button id="connectBtn" onclick="connectToDevice()">Connect to ESP32</button>
-    <br><br>
-    <button id="onBtn" onclick="toggleLed(1)" disabled>Turn ON</button>
-    <button id="offBtn" onclick="toggleLed(0)" disabled>Turn OFF</button>
-
     <p id="status">Status: Disconnected</p>
 
+    <div class="circle-wrap" id="sliderWrap">
+        <svg id="sliderSVG" viewBox="0 0 200 200">
+            <defs>
+                <linearGradient id="g1" x1="0%" x2="100%" y1="0%" y2="0%">
+                    <stop offset="0%" stop-color="#ff7a18" />
+                    <stop offset="100%" stop-color="#af002d" />
+                </linearGradient>
+            </defs>
+            <circle cx="100" cy="100" r="72" fill="none" stroke="#eee" stroke-width="14" />
+            <circle id="progress" cx="100" cy="100" r="72" fill="none" stroke="url(#g1)" stroke-width="14" stroke-linecap="round" transform="rotate(-90 100 100)" stroke-dasharray="452" stroke-dashoffset="452" />
+            <circle id="knob" cx="100" cy="28" r="8" fill="#333" stroke="#fff" stroke-width="2" cursor="pointer" />
+        </svg>
+        <div id="powerLabel">0 %</div>
+        <div id="centerToggle" class="center-btn">OFF</div>
+    </div>
+
+    <div id="controls">
+        <button id="decBtn" class="small-btn" onclick="sendPower(Math.max(0, currentPower-5))" disabled>-5%</button>
+        <button id="incBtn" class="small-btn" onclick="sendPower(Math.min(100, currentPower+5))" disabled>+5%</button>
+    </div>
+
     <script>
-        // Must match the ESP32 code
+        // Use UUIDs that match the ESP32 firmware
         const serviceUUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
         const charUUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+        
 
         let device;
         let characteristic;
+        let currentPower = 0;
+        let lastNonZero = 50;
 
+        // SVG elements
+        const svg = document.getElementById('sliderSVG');
+        const progress = document.getElementById('progress');
+        const knob = document.getElementById('knob');
+        const label = document.getElementById('powerLabel');
+        const centerToggle = document.getElementById('centerToggle');
+
+        const R = 72; // radius in svg coords
+        const C = 100; // center
+        const CIRC = 2 * Math.PI * R; // circumference
+        progress.style.strokeDasharray = `${CIRC}`;
+
+        function pctToOffset(p) {
+            return CIRC * (1 - p / 100);
+        }
+
+        function setUI(p) {
+            if (p < 0) p = 0; if (p > 100) p = 100;
+            currentPower = Math.round(p);
+            label.innerText = `${currentPower} %`;
+            progress.style.strokeDashoffset = pctToOffset(currentPower);
+            // position knob
+            const angle = (currentPower / 100) * 360 - 90; // start at top
+            const rad = angle * Math.PI / 180;
+            const x = C + R * Math.cos(rad);
+            const y = C + R * Math.sin(rad);
+            knob.setAttribute('cx', x);
+            knob.setAttribute('cy', y);
+            centerToggle.innerText = currentPower === 0 ? 'OFF' : 'ON';
+        }
+
+        function pointToPercent(x, y) {
+            const dx = x - C;
+            const dy = y - C;
+            let angle = Math.atan2(dy, dx) * 180 / Math.PI + 90; // 0 at top
+            if (angle < 0) angle += 360;
+            const p = (angle / 360) * 100;
+            return p;
+        }
+
+        // Drag handling
+        let dragging = false;
+        function startDrag(evt) {
+            dragging = true;
+            const pt = getPoint(evt);
+            const p = pointToPercent(pt.x, pt.y);
+            setUI(p);
+        }
+        function moveDrag(evt) {
+            if (!dragging) return;
+            const pt = getPoint(evt);
+            const p = pointToPercent(pt.x, pt.y);
+            setUI(p);
+        }
+        function endDrag(evt) {
+            if (!dragging) return;
+            dragging = false;
+            sendPower(currentPower);
+        }
+
+        function getPoint(evt) {
+            const rect = svg.getBoundingClientRect();
+            const clientX = evt.touches ? evt.touches[0].clientX : evt.clientX;
+            const clientY = evt.touches ? evt.touches[0].clientY : evt.clientY;
+            const x = (clientX - rect.left) * (200 / rect.width);
+            const y = (clientY - rect.top) * (200 / rect.height);
+            return { x, y };
+        }
+
+        svg.addEventListener('pointerdown', (e) => { svg.setPointerCapture(e.pointerId); startDrag(e); });
+        svg.addEventListener('pointermove', moveDrag);
+        svg.addEventListener('pointerup', endDrag);
+        svg.addEventListener('pointercancel', endDrag);
+
+        // Center toggle
+        centerToggle.addEventListener('click', () => {
+            if (currentPower === 0) {
+                // restore
+                sendPower(lastNonZero || 50);
+            } else {
+                lastNonZero = currentPower;
+                sendPower(0);
+            }
+        });
+
+        // BLE connect/send
         async function connectToDevice() {
             try {
                 document.getElementById('status').innerText = "Status: Scanning...";
-                
                 device = await navigator.bluetooth.requestDevice({
-                    filters: [{ name: 'ESP32_LED_CONTROL' }],
+                    filters: [{ name: 'ESP32_DIMMER' }],
                     optionalServices: [serviceUUID]
                 });
-
                 document.getElementById('status').innerText = "Status: Connecting...";
-                
                 const server = await device.gatt.connect();
                 const service = await server.getPrimaryService(serviceUUID);
                 characteristic = await service.getCharacteristic(charUUID);
-
-                // Enable buttons
                 document.getElementById('connectBtn').disabled = true;
-                document.getElementById('onBtn').disabled = false;
-                document.getElementById('offBtn').disabled = false;
                 document.getElementById('status').innerText = "Status: Connected!";
-
-                // Listen for disconnection
+                document.getElementById('incBtn').disabled = false;
+                document.getElementById('decBtn').disabled = false;
                 device.addEventListener('gattserverdisconnected', onDisconnected);
-
+                window.addEventListener('wheel', onWheel);
             } catch (error) {
                 console.error(error);
                 document.getElementById('status').innerText = "Status: Error - " + error;
             }
         }
 
-        async function toggleLed(state) {
+        async function sendPower(p) {
             if (!characteristic) return;
-
-            // Create a Uint8Array (byte) to send
-            // 1 for ON, 0 for OFF
-            const data = new Uint8Array([state]);
-
+            if (p < 0) p = 0; if (p > 100) p = 100;
+            setUI(p);
             try {
-                await characteristic.writeValue(data);
-                console.log("Sent: " + state);
+                await characteristic.writeValue(new Uint8Array([currentPower]));
             } catch (error) {
-                console.error("Write failed", error);
-                document.getElementById('status').innerText = "Status: Write Failed";
+                console.error('Write failed', error);
+                document.getElementById('status').innerText = 'Status: Write Failed';
             }
         }
 
         function onDisconnected(event) {
             document.getElementById('status').innerText = "Status: Disconnected";
             document.getElementById('connectBtn').disabled = false;
-            document.getElementById('onBtn').disabled = true;
-            document.getElementById('offBtn').disabled = true;
+            document.getElementById('incBtn').disabled = true;
+            document.getElementById('decBtn').disabled = true;
+            window.removeEventListener('wheel', onWheel);
         }
+
+        function onWheel(e) {
+            const step = 1;
+            if (e.deltaY < 0) sendPower(currentPower + step);
+            else sendPower(currentPower - step);
+        }
+
+        // init UI
+        setUI(0);
     </script>
 </body>
 </html>
