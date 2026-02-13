@@ -4,7 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ESP32 Dimmer Controller</title>
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#050505">
     <link rel="stylesheet" href="style.css">
+    <link rel="shortcut icon" href="./favicon.svg">
 </head>
 <body>
 
@@ -185,6 +188,11 @@
                 } catch (err) {
                     console.warn('Notifications not available', err);
                 }
+                // Indicate connected state on the Connect button
+                const connectBtn = document.getElementById('connectBtn');
+                connectBtn.disabled = true;
+                connectBtn.classList.add('connected');
+                connectBtn.innerText = 'Connected';
             } catch (error) {
                 console.error(error);
                 document.getElementById('status').innerText = "Status: Error - " + error;
@@ -213,7 +221,10 @@
 
         async function onDisconnected(event) {
             document.getElementById('status').innerText = "Status: Disconnected";
-            document.getElementById('connectBtn').disabled = false;
+            const connectBtn = document.getElementById('connectBtn');
+            connectBtn.disabled = false;
+            connectBtn.classList.remove('connected');
+            connectBtn.innerText = 'Connect to ESP32';
             document.getElementById('incBtn').disabled = true;
             document.getElementById('decBtn').disabled = true;
             document.getElementById('fullBtn').disabled = true;
@@ -237,6 +248,13 @@
 
         // init UI
         setUI(0);
+
+        // Register service worker for PWA
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('sw.js').then(() => {
+                console.log('Service Worker registered');
+            }).catch((err) => console.warn('SW registration failed', err));
+        }
     </script>
 </body>
 </html>

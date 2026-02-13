@@ -17,9 +17,12 @@
 
 #define PIN_ZCD_INPUT GPIO_NUM_23   // Input from Zero Cross Detector
 #define PIN_TRIAC_GATE GPIO_NUM_22  // Output to TRIAC Gate
+#define PIN_SWITCH GPIO_NUM_21      // Physical toggle switch (active low)
 #define TRIAC_PULSE_US 500          // Duration of the trigger pulse in microseconds
 #define MAINS_FREQ_DEFAULT 60       // Fallback frequency if detection fails
 #define TIMER_RESOLUTION_HZ 1000000 // 1MHz resolution (1 tick = 1us)
+#define SWITCH_DEBOUNCE_MS 50      // Debounce time for switch
+#define SWITCH_DOUBLE_TAP_MS 400   // Max time between taps to consider double-tap
 
 static const char *TAG = "DIMMER";
 
@@ -30,14 +33,19 @@ typedef struct
     float power_percent;    // Target Power (0.0 to 100.0)
     float bias_percent;     // Hardware offset bias (0.0 to 100.0)
     uint64_t last_zcd_time; // Timestamp of last ZCD interrupt
+    float last_nonzero_power; // Remember last non-zero power for toggle restore
 } dimmer_state_t;
 
 volatile dimmer_state_t d_state = {
     .period_us = 8333,
     .frequency_hz = MAINS_FREQ_DEFAULT,
     .power_percent = 0.0, // Start off
-    .bias_percent = 1.0,  // Example: 5% offset
-    .last_zcd_time = 0};
+    .bias_percent = 0.0,  // Example: 5% offset
+    .last_zcd_time = 0,
+    .last_nonzero_power = 50.0f};
+
+static QueueHandle_t button_queue = NULL;
+
 
 gptimer_handle_t gptimer = NULL;
 static QueueHandle_t zcd_queue = NULL;
@@ -76,6 +84,8 @@ static esp_ble_adv_params_t adv_params = {
 
 static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
+static void IRAM_ATTR switch_isr_handler(void *arg);
+static void button_task(void *arg);
 static esp_gatt_if_t g_gatts_if = 0;
 static uint16_t g_conn_id = 0;
 static uint16_t g_char_handle = 0;
@@ -102,6 +112,80 @@ static void IRAM_ATTR zcd_isr_handler(void *arg)
     {
         xQueueSendFromISR(zcd_queue, &current_time, &xHigherPriorityTaskWoken);
         portYIELD_FROM_ISR();
+    }
+}
+
+// Switch ISR (button pressed -> falling edge)
+static void IRAM_ATTR switch_isr_handler(void *arg)
+{
+    // Only enqueue when the level is actually low (pressed)
+    if (gpio_get_level(PIN_SWITCH) != 0)
+        return;
+
+    uint64_t current_time = esp_timer_get_time();
+
+    // Simple ISR debounce: ignore events closer than SWITCH_DEBOUNCE_MS
+    static uint64_t last_time = 0;
+    if (current_time - last_time < (uint64_t)SWITCH_DEBOUNCE_MS * 1000ULL)
+        return;
+    last_time = current_time;
+
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    if (button_queue)
+    {
+        xQueueSendFromISR(button_queue, &current_time, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR();
+    }
+}
+
+// Button task: debounce, detect single vs double tap
+static void button_task(void *arg)
+{
+    uint64_t ts = 0;
+
+    for (;;)
+    {
+        if (xQueueReceive(button_queue, &ts, portMAX_DELAY) != pdTRUE)
+            continue;
+
+        // Basic debounce: wait and flush any bounces
+        vTaskDelay(pdMS_TO_TICKS(SWITCH_DEBOUNCE_MS));
+        uint64_t tmp;
+        while (xQueueReceive(button_queue, &tmp, 0) == pdTRUE)
+        {
+            ts = tmp; // take latest during bounce
+        }
+
+        // Wait for a possible second tap within DOUBLE_TAP_MS
+        uint64_t second_ts;
+        TickType_t wait_ticks = pdMS_TO_TICKS(SWITCH_DOUBLE_TAP_MS);
+        if (xQueueReceive(button_queue, &second_ts, wait_ticks) == pdTRUE)
+        {
+            // Debounce second
+            vTaskDelay(pdMS_TO_TICKS(SWITCH_DEBOUNCE_MS));
+            // Double-tap action: set power to 100%
+            d_state.power_percent = 100.0f;
+            d_state.last_nonzero_power = 100.0f;
+            ESP_LOGI(TAG, "Switch double-tap: set power 100%%");
+        }
+        else
+        {
+            // Single tap: toggle (off <-> restore last non-zero)
+            if (d_state.power_percent > 1.0f)
+            {
+                d_state.last_nonzero_power = d_state.power_percent;
+                d_state.power_percent = 0.0f;
+                ESP_LOGI(TAG, "Switch single-tap: OFF");
+            }
+            else
+            {
+                float restore = d_state.last_nonzero_power;
+                if (restore < 1.0f)
+                    restore = 50.0f;
+                d_state.power_percent = restore;
+                ESP_LOGI(TAG, "Switch single-tap: restore %.1f%%", d_state.power_percent);
+            }
+        }
     }
 }
 
@@ -201,6 +285,26 @@ void setup_gpio()
         xTaskCreate(zcd_task, "zcd_task", 3072, NULL, configMAX_PRIORITIES - 1, NULL);
     }
     gpio_isr_handler_add(PIN_ZCD_INPUT, zcd_isr_handler, NULL);
+
+    // Configure physical switch (active low, pull-up)
+    gpio_config_t io_conf_sw = {
+        .pin_bit_mask = (1ULL << PIN_SWITCH),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = 0,
+        .pull_down_en = 0,
+        .intr_type = GPIO_INTR_NEGEDGE // falling edge = pressed
+    };
+    gpio_config(&io_conf_sw);
+
+    // Create button queue and task
+    button_queue = xQueueCreate(5, sizeof(uint64_t));
+    if (button_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create button queue");
+    } else {
+        xTaskCreate(button_task, "button_task", 2048, NULL, configMAX_PRIORITIES - 2, NULL);
+    }
+
+    gpio_isr_handler_add(PIN_SWITCH, switch_isr_handler, NULL);
 }
 
 void setup_timer()
@@ -295,6 +399,8 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             if (val > 100)
                 val = 100;
             d_state.power_percent = (float)val;
+            if (val > 1)
+                d_state.last_nonzero_power = (float)val;
             ESP_LOGI(TAG, "BLE set power: %d%%", val);
         }
         if (param->write.need_rsp)

@@ -1,9 +1,17 @@
 body {
-    font-family: sans-serif;
+    font-family: Arial, Helvetica, sans-serif;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
     text-align: center;
     margin-top: 50px;
-    background: #111;
+    background: #222;
     color: #fff;
+}
+
+body:has(.connected) {
+    background: #050505 ;
 }
 
 button {
@@ -13,11 +21,19 @@ button {
     cursor: pointer;
     border-radius: 8px;
     border: none;
+    transition:.2s ease;
+    font-variant: small-caps;
+}
+
+button:active {
+    box-shadow: #fff 0px 0px !important;
+    transition:.2s ease;
 }
 
 #connectBtn {
     background-color: #007bff;
     color: white;
+    box-shadow: #fff 0px 1px;
 }
 
 #onBtn {
@@ -39,24 +55,32 @@ button:disabled {
     margin-top: 20px;
     font-weight: bold;
     color: #bbb;
+    font-style: italic;
 }
 
 #decBtn,
 #incBtn {
     background-color: #007bff;
-    color: #bbb;
+    color: #ddd;
 }
 
-body {
-    font-family: Arial, Helvetica, sans-serif;
-    padding: 20px;
-    display: flex;
-    flex-direction: column;
-    align-items: center
+#decBtn {
+    box-shadow: #fff -1px 1px;
+}
+
+#incBtn {
+    box-shadow: #fff 1px 1px;
+}
+
+#fullBtn {
+    background-color: #dd8800;
+    color: #fff;
+    box-shadow: #fff 0px 1px;
 }
 
 h1 {
-    margin-bottom: 8px
+    margin-bottom: 8px;
+    font-variant: small-caps;
 }
 
 #controls {
@@ -102,9 +126,34 @@ svg {
     align-items: center;
     justify-content: center;
     cursor: pointer;
+    font-weight: 800
 }
 
 .small-btn {
-    padding: 8px 12px;
+    padding: 12px 18px;
     font-size: 14px
+}
+
+/* Connected state for the Connect button (keeps green even when disabled) */
+#connectBtn.connected {
+    background-color: #28a745;
+    color: #fff;
+    box-shadow: #fff 0px 1px;
+}
+
+/* Ensure connected button remains visually active when disabled */
+#connectBtn.connected:disabled {
+    background-color: #28a745;
+    color: #fff;
+    opacity: 1;
+    cursor: default;
+}
+
+/* Make disabled controls clearly gray/low-contrast */
+button:disabled {
+    background-color: #888888;
+    color: #ddd;
+    cursor: not-allowed;
+    filter: grayscale(80%);
+    opacity: 0.9;
 }

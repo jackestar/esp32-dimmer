@@ -1,0 +1,9 @@
+{
+  "name": "ESP32 Dimmer Controller",
+  "short_name": "Dimmer",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "background_color": "#050505",
+  "theme_color": "#050505"
+}
