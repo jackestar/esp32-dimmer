@@ -20,7 +20,7 @@
 #define PIN_ZCD_INPUT GPIO_NUM_23   // Input from Zero Cross Detector
 #define PIN_TRIAC_GATE GPIO_NUM_22  // Output to TRIAC Gate
 #define PIN_SWITCH GPIO_NUM_21      // Physical toggle switch (active low)
-#define TRIAC_PULSE_US 500          // Duration of the trigger pulse in microseconds
+#define TRIAC_PULSE_US 600          // Duration of the trigger pulse in microseconds (shorter reduces heating/flicker)
 #define MAINS_FREQ_DEFAULT 60       // Fallback frequency if detection fails
 #define TIMER_RESOLUTION_HZ 1000000 // 1MHz resolution (1 tick = 1us)
 #define SWITCH_DEBOUNCE_MS 50      // Debounce time for switch
@@ -44,12 +44,13 @@ volatile dimmer_state_t d_state = {
     .power_percent = 0.0, // Start off
     .bias_percent = 17.0,  // Example: 5% offset
     .last_zcd_time = 0,
-    .last_nonzero_power = 50.0f};
+    .last_nonzero_power = 100.0f};
 
 static QueueHandle_t button_queue = NULL;
 
 
 gptimer_handle_t gptimer = NULL;
+gptimer_handle_t pulse_timer = NULL;
 static QueueHandle_t zcd_queue = NULL;
 
 // ---------------- BLE CONFIG ----------------
@@ -98,15 +99,31 @@ static void load_settings(void);
 static void save_settings(void);
 
 // Timer Alarm ISR
-static bool IRAM_ATTR triac_timer_cb(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data)
+static bool IRAM_ATTR triac_pulse_cb(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data)
 {
-    gpio_set_level(PIN_TRIAC_GATE, 1);
-    ets_delay_us(TRIAC_PULSE_US);
     gpio_set_level(PIN_TRIAC_GATE, 0);
+    gptimer_stop(timer);
+    return false;
+}
+
+static bool IRAM_ATTR triac_fire_cb(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data)
+{
+    // Set gate high and arm the short pulse timer to clear it. Keep this callback minimal and non-blocking.
+    gpio_set_level(PIN_TRIAC_GATE, 1);
+
+    if (pulse_timer) {
+        gptimer_alarm_config_t pulse_alarm = {
+            .alarm_count = TRIAC_PULSE_US,
+            .reload_count = 0,
+            .flags.auto_reload_on_alarm = false,
+        };
+        gptimer_set_raw_count(pulse_timer, 0);
+        gptimer_set_alarm_action(pulse_timer, &pulse_alarm);
+        gptimer_start(pulse_timer);
+    }
 
     gptimer_stop(timer);
-
-    return false; // No task yield needed
+    return false;
 }
 
 // GPIO ISR
@@ -212,10 +229,14 @@ static void zcd_task(void *arg)
         uint32_t diff = (uint32_t)(timestamp - last_time);
         last_time = timestamp;
         d_state.last_zcd_time = timestamp;
-
         if (diff > 2000 && diff < 15000)
         {
             d_state.period_us = diff;
+            // Smooth measured half-cycle durations with an exponential moving average
+            // const float alpha = 0.20f; // smoothing factor: 0.0 (very smooth) .. 1.0 (no smoothing)
+            // float cur = (float)d_state.period_us;
+            // cur = (1.0f - alpha) * cur + alpha * (float)diff;
+            // d_state.period_us = (uint32_t)(cur + 0.5f);
         }
 
         float target_power = d_state.power_percent;
@@ -227,9 +248,18 @@ static void zcd_task(void *arg)
 
         if (target_power >= 99.0f)
         {
+            // Fire immediately but use the pulse_timer to clear the gate (non-blocking)
             gpio_set_level(PIN_TRIAC_GATE, 1);
-            ets_delay_us(TRIAC_PULSE_US);
-            gpio_set_level(PIN_TRIAC_GATE, 0);
+            if (pulse_timer) {
+                gptimer_alarm_config_t pulse_alarm = {
+                    .alarm_count = TRIAC_PULSE_US,
+                    .reload_count = 0,
+                    .flags.auto_reload_on_alarm = false,
+                };
+                gptimer_set_raw_count(pulse_timer, 0);
+                gptimer_set_alarm_action(pulse_timer, &pulse_alarm);
+                gptimer_start(pulse_timer);
+            }
             gptimer_stop(gptimer);
             continue;
         }
@@ -324,12 +354,18 @@ void setup_timer()
         .resolution_hz = TIMER_RESOLUTION_HZ, // 1us tick
     };
     ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &gptimer));
+    ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &pulse_timer));
 
-    gptimer_event_callbacks_t cbs = {
-        .on_alarm = triac_timer_cb,
+    gptimer_event_callbacks_t fire_cbs = {
+        .on_alarm = triac_fire_cb,
     };
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &cbs, NULL));
+    gptimer_event_callbacks_t pulse_cbs = {
+        .on_alarm = triac_pulse_cb,
+    };
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &fire_cbs, NULL));
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(pulse_timer, &pulse_cbs, NULL));
     ESP_ERROR_CHECK(gptimer_enable(gptimer));
+    ESP_ERROR_CHECK(gptimer_enable(pulse_timer));
 }
 
 // Load persisted settings from NVS
@@ -498,14 +534,6 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
         g_connected = true;
         g_gatts_if = gatts_if;
         g_conn_id = param->connect.conn_id;
-        // Send current power and bias to the newly connected client so UI can sync
-        if (g_char_handle != 0) {
-            uint8_t notify_vals[2] = {(uint8_t)d_state.power_percent, (uint8_t)d_state.bias_percent};
-            esp_err_t res = esp_ble_gatts_send_indicate(gatts_if, g_conn_id, g_char_handle, 2, notify_vals, false);
-            if (res != ESP_OK) {
-                ESP_LOGW(TAG, "Failed to indicate initial values: %s", esp_err_to_name(res));
-            }
-        }
         break;
 
     case ESP_GATTS_DISCONNECT_EVT:
@@ -556,7 +584,7 @@ void app_main(void)
     while (1)
     {
         if (d_state.period_us > 0)
-            d_state.frequency_hz = 1000000.0f / (float)d_state.period_us / 2.0f;
+            d_state.frequency_hz = (float)TIMER_RESOLUTION_HZ / (float)d_state.period_us / 2.0f;
 
         ESP_LOGI(TAG, "Freq: %.2f Hz | Power: %.1f %% | Period: %lu us",
                  d_state.frequency_hz, d_state.power_percent, d_state.period_us);
