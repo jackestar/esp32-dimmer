@@ -25,6 +25,10 @@
 #define TIMER_RESOLUTION_HZ 1000000 // 1MHz resolution (1 tick = 1us)
 #define SWITCH_DEBOUNCE_MS 50      // Debounce time for switch
 #define SWITCH_DOUBLE_TAP_MS 400   // Max time between taps to consider double-tap
+#define ZCD_MIN_US 2000            // Ignore ZCD intervals shorter than this (noise)
+#define ZCD_MAX_US 15000           // Ignore ZCD intervals longer than this
+#define ZCD_TOLERANCE_PERCENT 8    // Acceptable deviation from expected half-period (percent)
+#define ZCD_GOOD_REQUIRED 2       // Consecutive good cycles required to accept a measured change
 
 static const char *TAG = "DIMMER";
 
@@ -220,6 +224,7 @@ static void zcd_task(void *arg)
 {
     uint64_t timestamp = 0;
     uint64_t last_time = 0;
+    int consecutive_good = 0;
 
     for (;;)
     {
@@ -229,15 +234,25 @@ static void zcd_task(void *arg)
         uint32_t diff = (uint32_t)(timestamp - last_time);
         last_time = timestamp;
         d_state.last_zcd_time = timestamp;
-        if (diff > 2000 && diff < 15000)
-        {
-            d_state.period_us = diff;
-            // Smooth measured half-cycle durations with an exponential moving average
-            // const float alpha = 0.20f; // smoothing factor: 0.0 (very smooth) .. 1.0 (no smoothing)
-            // float cur = (float)d_state.period_us;
-            // cur = (1.0f - alpha) * cur + alpha * (float)diff;
-            // d_state.period_us = (uint32_t)(cur + 0.5f);
+
+        // Ignore obviously-bad intervals (likely noise / bounces)
+        if (diff < ZCD_MIN_US || diff > ZCD_MAX_US) {
+            // skip this noisy edge; do not resync or schedule from it
+            continue;
         }
+
+        // Keep using a fixed mains half-period for timing; only accept measured changes
+        // after several consecutive valid cycles to avoid sudden sync jumps.
+        uint32_t expected_half_us = (uint32_t)(1000000UL / (MAINS_FREQ_DEFAULT * 2UL));
+        uint32_t tol_us = (expected_half_us * ZCD_TOLERANCE_PERCENT) / 100U;
+        if (diff >= (expected_half_us > tol_us ? expected_half_us - tol_us : 0) && diff <= expected_half_us + tol_us) {
+            consecutive_good++;
+        } else {
+            consecutive_good = 0;
+        }
+
+        // If we have not reached the required number of good cycles yet, do not change period.
+        d_state.period_us = expected_half_us;
 
         float target_power = d_state.power_percent;
         if (target_power <= 1.0f)
