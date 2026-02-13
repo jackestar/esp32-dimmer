@@ -9,10 +9,12 @@
 #include "esp_log.h"
 #include "rom/ets_sys.h" // For ets_delay_us
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_bt.h"
 #include "esp_gap_ble_api.h"
 #include "esp_gatts_api.h"
 #include "esp_bt_main.h"
+#include "esp_err.h"
 #include <string.h>
 
 #define PIN_ZCD_INPUT GPIO_NUM_23   // Input from Zero Cross Detector
@@ -40,7 +42,7 @@ volatile dimmer_state_t d_state = {
     .period_us = 8333,
     .frequency_hz = MAINS_FREQ_DEFAULT,
     .power_percent = 0.0, // Start off
-    .bias_percent = 0.0,  // Example: 5% offset
+    .bias_percent = 17.0,  // Example: 5% offset
     .last_zcd_time = 0,
     .last_nonzero_power = 50.0f};
 
@@ -90,6 +92,10 @@ static esp_gatt_if_t g_gatts_if = 0;
 static uint16_t g_conn_id = 0;
 static uint16_t g_char_handle = 0;
 static bool g_connected = false;
+
+// NVS helpers to persist power and bias
+static void load_settings(void);
+static void save_settings(void);
 
 // Timer Alarm ISR
 static bool IRAM_ATTR triac_timer_cb(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data)
@@ -166,6 +172,7 @@ static void button_task(void *arg)
             // Double-tap action: set power to 100%
             d_state.power_percent = 100.0f;
             d_state.last_nonzero_power = 100.0f;
+            save_settings();
             ESP_LOGI(TAG, "Switch double-tap: set power 100%%");
         }
         else
@@ -175,6 +182,7 @@ static void button_task(void *arg)
             {
                 d_state.last_nonzero_power = d_state.power_percent;
                 d_state.power_percent = 0.0f;
+                save_settings();
                 ESP_LOGI(TAG, "Switch single-tap: OFF");
             }
             else
@@ -183,6 +191,7 @@ static void button_task(void *arg)
                 if (restore < 1.0f)
                     restore = 50.0f;
                 d_state.power_percent = restore;
+                save_settings();
                 ESP_LOGI(TAG, "Switch single-tap: restore %.1f%%", d_state.power_percent);
             }
         }
@@ -323,6 +332,59 @@ void setup_timer()
     ESP_ERROR_CHECK(gptimer_enable(gptimer));
 }
 
+// Load persisted settings from NVS
+static void load_settings(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("dimmer", NVS_READONLY, &nvs);
+    if (err == ESP_OK)
+    {
+        int32_t p = 0, b = 0;
+        if (nvs_get_i32(nvs, "power", &p) == ESP_OK)
+        {
+            if (p < 0) p = 0;
+            if (p > 100) p = 100;
+            d_state.power_percent = (float)p;
+            if (p > 1)
+                d_state.last_nonzero_power = (float)p;
+            ESP_LOGI(TAG, "Loaded power %% from NVS: %d", p);
+        }
+        if (nvs_get_i32(nvs, "bias", &b) == ESP_OK)
+        {
+            if (b < 0) b = 0;
+            if (b > 100) b = 100;
+            d_state.bias_percent = (float)b;
+            ESP_LOGI(TAG, "Loaded bias %% from NVS: %d", b);
+        }
+        nvs_close(nvs);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "No stored settings in NVS or NVS open failed: %s", esp_err_to_name(err));
+    }
+}
+
+// Save current settings to NVS
+static void save_settings(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("dimmer", NVS_READWRITE, &nvs);
+    if (err == ESP_OK)
+    {
+        int32_t p = (int32_t)(d_state.power_percent + 0.5f);
+        int32_t b = (int32_t)(d_state.bias_percent + 0.5f);
+        nvs_set_i32(nvs, "power", p);
+        nvs_set_i32(nvs, "bias", b);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Saved settings to NVS: power=%d bias=%d", p, b);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Failed to open NVS for save: %s", esp_err_to_name(err));
+    }
+}
+
 // BLE handler
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
@@ -401,17 +463,32 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             d_state.power_percent = (float)val;
             if (val > 1)
                 d_state.last_nonzero_power = (float)val;
-            ESP_LOGI(TAG, "BLE set power: %d%%", val);
+
+            if (param->write.len > 1)
+            {
+                uint8_t bias = param->write.value[1];
+                if (bias > 100)
+                    bias = 100;
+                d_state.bias_percent = (float)bias;
+                ESP_LOGI(TAG, "BLE set power: %d%% bias: %d%%", val, bias);
+            }
+            else
+            {
+                ESP_LOGI(TAG, "BLE set power: %d%%", val);
+            }
+
+            // Persist changes
+            save_settings();
         }
         if (param->write.need_rsp)
         {
             esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
         }
 
-        // Notify connected client of the updated value (if any)
+        // Notify connected client of the updated values (power,bias)
         if (g_connected && g_char_handle != 0) {
-            uint8_t notify_val = (uint8_t)d_state.power_percent;
-            esp_ble_gatts_send_indicate(g_gatts_if, g_conn_id, g_char_handle, 1, &notify_val, false);
+            uint8_t notify_vals[2] = {(uint8_t)d_state.power_percent, (uint8_t)d_state.bias_percent};
+            esp_ble_gatts_send_indicate(g_gatts_if, g_conn_id, g_char_handle, 2, notify_vals, false);
         }
         break;
     }
@@ -421,6 +498,14 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
         g_connected = true;
         g_gatts_if = gatts_if;
         g_conn_id = param->connect.conn_id;
+        // Send current power and bias to the newly connected client so UI can sync
+        if (g_char_handle != 0) {
+            uint8_t notify_vals[2] = {(uint8_t)d_state.power_percent, (uint8_t)d_state.bias_percent};
+            esp_err_t res = esp_ble_gatts_send_indicate(gatts_if, g_conn_id, g_char_handle, 2, notify_vals, false);
+            if (res != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to indicate initial values: %s", esp_err_to_name(res));
+            }
+        }
         break;
 
     case ESP_GATTS_DISCONNECT_EVT:
@@ -451,6 +536,9 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // Load persisted settings (power_percent, bias_percent)
+    load_settings();
 
     // Initialize Bluetooth
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();

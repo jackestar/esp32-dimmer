@@ -37,6 +37,11 @@
         <button id="incBtn" class="small-btn" onclick="sendPower(Math.min(100, currentPower+5))" disabled>+5%</button>
     </div>
 
+    <div id="biasControl" class="bias-control">
+        <label for="biasRange">Bias: <span id="biasLabel">0%</span></label>
+        <input id="biasRange" type="range" min="0" max="100" value="0" />
+    </div>
+
     <script>
         // Use UUIDs that match the ESP32 firmware
         const serviceUUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
@@ -46,6 +51,7 @@
         let device;
         let characteristic;
         let currentPower = 0;
+        let currentBias = 0;
         let lastNonZero = 50;
 
         // SVG elements
@@ -53,6 +59,8 @@
         const progress = document.getElementById('progress');
         const knob = document.getElementById('knob');
         const label = document.getElementById('powerLabel');
+        const biasRange = document.getElementById('biasRange');
+        const biasLabel = document.getElementById('biasLabel');
         const centerToggle = document.getElementById('centerToggle');
         const container = document.getElementById('sliderWrap');
 
@@ -80,6 +88,13 @@
             knob.setAttribute('cx', x);
             knob.setAttribute('cy', y);
             centerToggle.innerText = currentPower === 0 ? 'OFF' : 'ON';
+        }
+
+        function setBiasUI(b) {
+            if (b < 0) b = 0; if (b > 100) b = 100;
+            currentBias = Math.round(b);
+            biasLabel.innerText = `${currentBias} %`;
+            if (biasRange) biasRange.value = currentBias;
         }
 
         function pointToPercent(x, y) {
@@ -114,16 +129,16 @@
             setUI(value);
 
             // Throttle BLE writes while dragging for real-time feel without flooding
-            if (characteristic) {
-                const now = Date.now();
-                if (now - lastSendTime >= SEND_THROTTLE_MS) {
-                    // fire-and-forget write
-                    characteristic.writeValue(new Uint8Array([currentPower])).catch((e) => {
-                        console.warn('Throttled write failed', e);
-                    });
-                    lastSendTime = now;
+                if (characteristic) {
+                    const now = Date.now();
+                    if (now - lastSendTime >= SEND_THROTTLE_MS) {
+                        // fire-and-forget write (send power + bias)
+                        characteristic.writeValue(new Uint8Array([currentPower, currentBias])).catch((e) => {
+                            console.warn('Throttled write failed', e);
+                        });
+                        lastSendTime = now;
+                    }
                 }
-            }
         }
 
         // Prevent slider interaction when clicking the center button
@@ -193,6 +208,25 @@
                 connectBtn.disabled = true;
                 connectBtn.classList.add('connected');
                 connectBtn.innerText = 'Connected';
+                // wire bias control to update bias and send combined payload
+                if (biasRange) {
+                    // Update UI while dragging and send throttled writes so bias takes effect live
+                    biasRange.addEventListener('input', (e) => {
+                        setBiasUI(e.target.value);
+                        // Throttled live write of bias with current power
+                        if (characteristic) {
+                            const now = Date.now();
+                            if (now - lastSendTime >= SEND_THROTTLE_MS) {
+                                characteristic.writeValue(new Uint8Array([currentPower, currentBias])).catch((err) => console.warn('Bias live write failed', err));
+                                lastSendTime = now;
+                            }
+                        }
+                    });
+                    // Commit on change/end to ensure final value is sent
+                    biasRange.addEventListener('change', (e) => {
+                        sendPower(currentPower);
+                    });
+                }
             } catch (error) {
                 console.error(error);
                 document.getElementById('status').innerText = "Status: Error - " + error;
@@ -204,7 +238,7 @@
             if (p < 0) p = 0; if (p > 100) p = 100;
             setUI(p);
             try {
-                await characteristic.writeValue(new Uint8Array([currentPower]));
+                await characteristic.writeValue(new Uint8Array([currentPower, currentBias]));
             } catch (error) {
                 console.error('Write failed', error);
                 document.getElementById('status').innerText = 'Status: Write Failed';
@@ -217,6 +251,10 @@
             if (!data || data.byteLength < 1) return;
             const v = data.getUint8(0);
             setUI(v);
+            if (data.byteLength > 1) {
+                const b = data.getUint8(1);
+                setBiasUI(b);
+            }
         }
 
         async function onDisconnected(event) {
@@ -248,6 +286,7 @@
 
         // init UI
         setUI(0);
+        setBiasUI(0);
 
         // Register service worker for PWA
         if ('serviceWorker' in navigator) {
