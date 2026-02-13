@@ -42,6 +42,20 @@
         <input id="biasRange" type="range" min="0" max="100" value="17" />
     </div>
 
+    <div id="effects" class="effects">
+        <div class="effect-group">
+            <button id="blinkToggle" class="small-btn" disabled onclick="toggleBlink()">Start Blink</button>
+            <label for="blinkFreq">Freq: <span id="blinkFreqLabel">1.0 Hz</span></label>
+            <input id="blinkFreq" type="range" min="0.1" max="10" step="0.1" value="1.0" />
+        </div>
+
+        <div class="effect-group">
+            <button id="fadeToggle" class="small-btn" disabled onclick="toggleFade()">Start Fade</button>
+            <label for="fadeSpeed">Speed: <span id="fadeSpeedLabel">0.8 Hz</span></label>
+            <input id="fadeSpeed" type="range" min="0.1" max="3" step="0.1" value="0.8" />
+        </div>
+    </div>
+
     <script>
         // Use UUIDs that match the ESP32 firmware
         const serviceUUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
@@ -193,6 +207,9 @@
                 document.getElementById('incBtn').disabled = false;
                 document.getElementById('decBtn').disabled = false;
                 document.getElementById('fullBtn').disabled = false;
+                // enable effect controls
+                if (blinkToggle) blinkToggle.disabled = false;
+                if (fadeToggle) fadeToggle.disabled = false;
                 device.addEventListener('gattserverdisconnected', onDisconnected);
                 window.addEventListener('wheel', onWheel);
 
@@ -266,6 +283,11 @@
             document.getElementById('incBtn').disabled = true;
             document.getElementById('decBtn').disabled = true;
             document.getElementById('fullBtn').disabled = true;
+            // stop and disable effects
+            try { stopBlink(); } catch (e) {}
+            try { stopFade(); } catch (e) {}
+            if (blinkToggle) blinkToggle.disabled = true;
+            if (fadeToggle) fadeToggle.disabled = true;
             window.removeEventListener('wheel', onWheel);
             // Unsubscribe notifications
             try {
@@ -287,6 +309,92 @@
         // init UI
         setUI(0);
         setBiasUI(0);
+
+        // Effects state
+        let blinkInterval = null;
+        let blinkOn = false;
+        const blinkToggle = document.getElementById('blinkToggle');
+        const blinkFreq = document.getElementById('blinkFreq');
+        const blinkFreqLabel = document.getElementById('blinkFreqLabel');
+
+        const fadeToggle = document.getElementById('fadeToggle');
+        const fadeSpeed = document.getElementById('fadeSpeed');
+        const fadeSpeedLabel = document.getElementById('fadeSpeedLabel');
+        let fadeRunning = false;
+        let fadeAnimId = null;
+        let fadeStart = 0;
+
+        blinkFreq.addEventListener('input', (e) => {
+            blinkFreqLabel.innerText = `${parseFloat(e.target.value).toFixed(1)} Hz`;
+            if (blinkInterval) {
+                // restart with new frequency
+                clearInterval(blinkInterval);
+                startBlink();
+            }
+        });
+
+        fadeSpeed.addEventListener('input', (e) => {
+            fadeSpeedLabel.innerText = `${parseFloat(e.target.value).toFixed(1)} Hz`;
+        });
+
+        function toggleBlink() {
+            if (blinkInterval) stopBlink(); else startBlink();
+        }
+
+        function startBlink() {
+            const freq = Math.max(0.1, parseFloat(blinkFreq.value));
+            const halfPeriod = (1000 / freq) / 2; // ms for half-cycle
+            blinkOn = false;
+            blinkToggle.innerText = 'Stop Blink';
+            blinkInterval = setInterval(() => {
+                blinkOn = !blinkOn;
+                const target = blinkOn ? (lastNonZero || 100) : 0;
+                setUI(target);
+                if (characteristic) characteristic.writeValue(new Uint8Array([currentPower, currentBias])).catch(() => {});
+            }, halfPeriod);
+        }
+
+        function stopBlink() {
+            if (!blinkInterval) return;
+            clearInterval(blinkInterval);
+            blinkInterval = null;
+            blinkOn = false;
+            blinkToggle.innerText = 'Start Blink';
+            // restore UI to lastNonZero or 0
+            setUI(lastNonZero || 0);
+            if (characteristic) characteristic.writeValue(new Uint8Array([currentPower, currentBias])).catch(() => {});
+        }
+
+        function toggleFade() {
+            if (fadeRunning) stopFade(); else startFade();
+        }
+
+        function startFade() {
+            fadeRunning = true;
+            fadeToggle.innerText = 'Stop Fade';
+            fadeStart = performance.now();
+            const speedHz = Math.max(0.1, parseFloat(fadeSpeed.value));
+
+            function step(ts) {
+                const elapsed = (ts - fadeStart) / 1000; // seconds
+                const cycles = elapsed * speedHz;
+                // sine wave scaled 0..1, then multiplied by lastNonZero or 100
+                const v = (Math.sin(cycles * 2 * Math.PI) * 0.5 + 0.5) * (lastNonZero || 100);
+                setUI(Math.round(v));
+                if (characteristic) characteristic.writeValue(new Uint8Array([currentPower, currentBias])).catch(() => {});
+                fadeAnimId = requestAnimationFrame(step);
+            }
+            fadeAnimId = requestAnimationFrame(step);
+        }
+
+        function stopFade() {
+            fadeRunning = false;
+            fadeToggle.innerText = 'Start Fade';
+            if (fadeAnimId) cancelAnimationFrame(fadeAnimId);
+            fadeAnimId = null;
+            setUI(lastNonZero || 0);
+            if (characteristic) characteristic.writeValue(new Uint8Array([currentPower, currentBias])).catch(() => {});
+        }
 
         // Register service worker for PWA
         if ('serviceWorker' in navigator) {
