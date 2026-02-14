@@ -181,3 +181,24 @@ button:disabled {
     filter: grayscale(80%);
     opacity: 0.9;
 }
+
+#timerControl {
+    display:flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: center;
+    align-items: center;
+}
+
+#timerControl button {
+    flex: 3 30%;
+}
+
+#timerControl label, #timerControl input {
+    flex: 2 40%;
+}
+
+#timerControl input {
+    padding:1em;
+    border: none;
+}

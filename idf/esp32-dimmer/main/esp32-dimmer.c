@@ -3,6 +3,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/timers.h"
 #include "driver/gpio.h"
 #include "driver/gptimer.h"
 #include "esp_timer.h"
@@ -42,6 +43,14 @@ typedef struct
     float last_nonzero_power; // Remember last non-zero power for toggle restore
 } dimmer_state_t;
 
+// ZCD event: timestamp + level (rising/falling). We compute midpoint
+// between paired edges to get accurate zero-cross timing when the ZCD
+// produces a pulse rather than a sharp edge.
+typedef struct {
+    uint64_t time;
+    uint8_t level;
+} zcd_event_t;
+
 volatile dimmer_state_t d_state = {
     .period_us = 8333,
     .frequency_hz = MAINS_FREQ_DEFAULT,
@@ -56,6 +65,9 @@ static QueueHandle_t button_queue = NULL;
 gptimer_handle_t gptimer = NULL;
 gptimer_handle_t pulse_timer = NULL;
 static QueueHandle_t zcd_queue = NULL;
+// Scheduled on/off timer
+static TimerHandle_t schedule_timer = NULL;
+static uint8_t scheduled_action = 0xFF; // 0=off,1=on,0xFF=none
 
 // ---------------- BLE CONFIG ----------------
 #define PROFILE_NUM 1
@@ -130,6 +142,32 @@ static bool IRAM_ATTR triac_fire_cb(gptimer_handle_t timer, const gptimer_alarm_
     return false;
 }
 
+// Callback run in Timer/Task context when a scheduled on/off fires
+static void schedule_timer_cb(TimerHandle_t xTimer)
+{
+    if (scheduled_action == 1) {
+        float restore = d_state.last_nonzero_power;
+        if (restore < 1.0f)
+            restore = 50.0f;
+        d_state.power_percent = restore;
+        d_state.last_nonzero_power = restore;
+        ESP_LOGI(TAG, "Scheduled action: TURN ON -> %.1f%%", d_state.power_percent);
+    } else if (scheduled_action == 0) {
+        if (d_state.power_percent > 1.0f)
+            d_state.last_nonzero_power = d_state.power_percent;
+        d_state.power_percent = 0.0f;
+        ESP_LOGI(TAG, "Scheduled action: TURN OFF");
+    } else {
+        ESP_LOGI(TAG, "Scheduled action: unknown (%d)", scheduled_action);
+    }
+    save_settings();
+    scheduled_action = 0xFF;
+    if (schedule_timer) {
+        xTimerDelete(schedule_timer, 0);
+        schedule_timer = NULL;
+    }
+}
+
 // GPIO ISR
 static void IRAM_ATTR zcd_isr_handler(void *arg)
 {
@@ -137,7 +175,8 @@ static void IRAM_ATTR zcd_isr_handler(void *arg)
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     if (zcd_queue)
     {
-        xQueueSendFromISR(zcd_queue, &current_time, &xHigherPriorityTaskWoken);
+        zcd_event_t ev = { .time = current_time, .level = (uint8_t)gpio_get_level(PIN_ZCD_INPUT) };
+        xQueueSendFromISR(zcd_queue, &ev, &xHigherPriorityTaskWoken);
         portYIELD_FROM_ISR();
     }
 }
@@ -222,22 +261,42 @@ static void button_task(void *arg)
 // Process ZCD events and arm timer / fire triac as needed
 static void zcd_task(void *arg)
 {
-    uint64_t timestamp = 0;
-    uint64_t last_time = 0;
+    zcd_event_t ev;
+    uint64_t last_edge_time = 0;
+    int last_edge_level = -1;
+    uint64_t last_zero_time = 0;
     int consecutive_good = 0;
 
     for (;;)
     {
-        if (xQueueReceive(zcd_queue, &timestamp, portMAX_DELAY) != pdTRUE)
+        if (xQueueReceive(zcd_queue, &ev, portMAX_DELAY) != pdTRUE)
             continue;
 
-        uint32_t diff = (uint32_t)(timestamp - last_time);
-        last_time = timestamp;
-        d_state.last_zcd_time = timestamp;
+        // Pair edges to compute the midpoint of the ZCD pulse (more accurate zero crossing).
+        if (last_edge_time == 0) {
+            last_edge_time = ev.time;
+            last_edge_level = ev.level;
+            continue;
+        }
+
+        // If we see the same level again, update the stored edge time (debounce-like)
+        if (ev.level == last_edge_level) {
+            last_edge_time = ev.time;
+            continue;
+        }
+
+        // We have a pair of opposite edges: compute midpoint
+        uint64_t zero_time = (last_edge_time + ev.time) / 2ULL;
+        uint32_t diff = (uint32_t)(zero_time - last_zero_time);
+        last_zero_time = zero_time;
+        d_state.last_zcd_time = zero_time;
+
+        // Reset stored edge so next pulse starts fresh
+        last_edge_time = 0;
+        last_edge_level = -1;
 
         // Ignore obviously-bad intervals (likely noise / bounces)
         if (diff < ZCD_MIN_US || diff > ZCD_MAX_US) {
-            // skip this noisy edge; do not resync or schedule from it
             continue;
         }
 
@@ -322,14 +381,14 @@ void setup_gpio()
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = 0, // Assume Open Collector Opto
         .pull_down_en = 0,
-        .intr_type = GPIO_INTR_POSEDGE // Trigger on Rising Edge (Start of logic ZCD)
+        .intr_type = GPIO_INTR_ANYEDGE // Trigger on any edge; we'll use midpoint of pulse
     };
     gpio_config(&io_conf_in);
 
     // Install ISR Service
     gpio_install_isr_service(0);
     // Create queue and zcd processing task
-    zcd_queue = xQueueCreate(10, sizeof(uint64_t));
+    zcd_queue = xQueueCreate(10, sizeof(zcd_event_t));
     if (zcd_queue == NULL)
     {
         ESP_LOGE(TAG, "Failed to create ZCD queue");
@@ -506,8 +565,40 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
 
     case ESP_GATTS_WRITE_EVT:
     {
-        if (param->write.len > 0)
-        {
+        // Special BLE scheduling command format:
+        // [0] = 0xFE, [1]=action(0=off,1=on,2=cancel), [2..5]=delay seconds (big-endian uint32)
+        if (param->write.len >= 6 && param->write.value[0] == 0xFE) {
+            uint8_t action = param->write.value[1];
+            uint32_t secs = ((uint32_t)param->write.value[2] << 24) | ((uint32_t)param->write.value[3] << 16) |
+                            ((uint32_t)param->write.value[4] << 8) | ((uint32_t)param->write.value[5]);
+
+            if (action == 2) {
+                // cancel
+                if (schedule_timer) {
+                    xTimerStop(schedule_timer, 0);
+                    xTimerDelete(schedule_timer, 0);
+                    schedule_timer = NULL;
+                }
+                scheduled_action = 0xFF;
+                ESP_LOGI(TAG, "BLE: canceled scheduled action");
+            } else {
+                // Create or replace existing timer
+                if (schedule_timer) {
+                    xTimerStop(schedule_timer, 0);
+                    xTimerDelete(schedule_timer, 0);
+                    schedule_timer = NULL;
+                }
+                TickType_t ticks = pdMS_TO_TICKS((uint64_t)secs * 1000ULL);
+                schedule_timer = xTimerCreate("sched", ticks, pdFALSE, NULL, schedule_timer_cb);
+                if (schedule_timer) {
+                    scheduled_action = action;
+                    xTimerStart(schedule_timer, 0);
+                    ESP_LOGI(TAG, "BLE: scheduled action %d in %u seconds", action, secs);
+                } else {
+                    ESP_LOGE(TAG, "BLE: failed to create schedule timer");
+                }
+            }
+        } else if (param->write.len > 0) {
             uint8_t val = param->write.value[0];
             if (val > 100)
                 val = 100;

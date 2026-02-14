@@ -31,6 +31,14 @@
         <div id="centerToggle" class="center-btn">OFF</div>
     </div>
 
+    <div id="timerControl" class="timer-control">
+        <label for="timerSeconds">Timer (seconds):</label>
+        <input id="timerSeconds" type="number" min="1" value="60" />
+        <button id="scheduleOnBtn" class="small-btn" disabled>Schedule ON</button>
+        <button id="scheduleOffBtn" class="small-btn" disabled>Schedule OFF</button>
+        <button id="cancelScheduleBtn" class="small-btn" disabled>Cancel</button>
+    </div>
+
     <div id="controls">
         <button id="decBtn" class="small-btn" onclick="sendPower(Math.max(0, currentPower-5))" disabled>-5%</button>
         <button id="fullBtn" class="small-btn" onclick="sendPower(100)" disabled>100%</button>
@@ -244,6 +252,10 @@
                         sendPower(currentPower);
                     });
                 }
+                // enable timer buttons when connected
+                if (scheduleOnBtn) scheduleOnBtn.disabled = false;
+                if (scheduleOffBtn) scheduleOffBtn.disabled = false;
+                if (cancelScheduleBtn) cancelScheduleBtn.disabled = false;
             } catch (error) {
                 console.error(error);
                 document.getElementById('status').innerText = "Status: Error - " + error;
@@ -283,6 +295,10 @@
             document.getElementById('incBtn').disabled = true;
             document.getElementById('decBtn').disabled = true;
             document.getElementById('fullBtn').disabled = true;
+            // disable timer buttons when disconnected
+            try { document.getElementById('scheduleOnBtn').disabled = true; } catch (e) {}
+            try { document.getElementById('scheduleOffBtn').disabled = true; } catch (e) {}
+            try { document.getElementById('cancelScheduleBtn').disabled = true; } catch (e) {}
             // stop and disable effects
             try { stopBlink(); } catch (e) {}
             try { stopFade(); } catch (e) {}
@@ -309,6 +325,43 @@
         // init UI
         setUI(0);
         setBiasUI(0);
+
+        // Timer controls (schedule on/off/cancel)
+        const timerSeconds = document.getElementById('timerSeconds');
+        const scheduleOnBtn = document.getElementById('scheduleOnBtn');
+        const scheduleOffBtn = document.getElementById('scheduleOffBtn');
+        const cancelScheduleBtn = document.getElementById('cancelScheduleBtn');
+
+        function sendSchedule(action, secs) {
+            if (!characteristic) return;
+            if (!Number.isFinite(secs) || secs < 0) return;
+            const s = Math.floor(secs) >>> 0; // ensure uint32
+            const arr = new Uint8Array(6);
+            arr[0] = 0xFE;
+            arr[1] = action & 0xFF; // 0=off,1=on,2=cancel
+            arr[2] = (s >> 24) & 0xFF;
+            arr[3] = (s >> 16) & 0xFF;
+            arr[4] = (s >> 8) & 0xFF;
+            arr[5] = s & 0xFF;
+            characteristic.writeValue(arr).then(() => {
+                document.getElementById('status').innerText = `Status: Scheduled action ${action} in ${s}s`;
+            }).catch((e) => {
+                console.warn('Schedule write failed', e);
+                document.getElementById('status').innerText = 'Status: Schedule write failed';
+            });
+        }
+
+        scheduleOnBtn.addEventListener('click', () => {
+            const secs = parseInt(timerSeconds.value, 10) || 0;
+            sendSchedule(1, secs);
+        });
+        scheduleOffBtn.addEventListener('click', () => {
+            const secs = parseInt(timerSeconds.value, 10) || 0;
+            sendSchedule(0, secs);
+        });
+        cancelScheduleBtn.addEventListener('click', () => {
+            sendSchedule(2, 0);
+        });
 
         // Effects state
         let blinkInterval = null;
